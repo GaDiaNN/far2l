@@ -66,6 +66,13 @@ size_t LocalSocket::Recv(void *data, size_t len)
 		: 0;
 }
 
+void LocalSocket::Shutdown()
+{
+	if ((int)_sock != -1) {
+		shutdown(_sock, SHUT_RDWR);
+	}
+}
+
 size_t LocalSocket::SendTo(const void *data, size_t len, const struct sockaddr_un &sa)
 {
 	return len

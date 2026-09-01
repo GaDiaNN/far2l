@@ -39,6 +39,12 @@ public:
 	void SendFD(int fd);
 	int RecvFD();
 
+	// Unblock a concurrent blocking Recv()/Send() on this socket: the syscall then
+	// returns 0 and SocketIO throws LocalSocketDisconnected, so a thread parked in
+	// Recv() can be woken from another thread to shut it down cleanly. Safe to call
+	// on an already-closed socket. Does not close the fd (owned by FDScope).
+	void Shutdown();
+
 	enum Kind
 	{
 		DATAGRAM,
