@@ -2,13 +2,22 @@
 #include <utils.h>
 #include <Threaded.h>
 #include <atomic>
+#include <mutex>
 #include <string>
 #include "TestProtocol.h"
+
+class LocalSocket;
 
 class TestController : protected Threaded
 {
 	std::atomic<bool> _stop{false};
 	std::string _ipc_server;
+
+	// Points at ClientLoop's socket while the loop runs, guarded by _sock_mtx so the
+	// destructor can Shutdown() it to unblock Recv() and let the thread exit before we
+	// join it (see ~TestController / ClientLoop).
+	std::mutex _sock_mtx;
+	LocalSocket *_active_sock = nullptr;
 
 	union TestBuf
 	{

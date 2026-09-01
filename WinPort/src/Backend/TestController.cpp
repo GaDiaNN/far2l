@@ -24,7 +24,36 @@ TestController::TestController(const std::string &id)
 TestController::~TestController()
 {
 	_stop = true;
+	// Wake ClientLoop out of its blocking Recv() so it observes _stop and returns,
+	// letting WaitThread() join before our owner tears down g_winport_con_in/out.
+	// Holding _sock_mtx across Shutdown() prevents the loop from destroying the
+	// socket underneath us.
+	{
+		std::lock_guard<std::mutex> lock(_sock_mtx);
+		if (_active_sock) {
+			_active_sock->Shutdown();
+		}
+	}
 	WaitThread();
+}
+
+// RAII: publish ClientLoop's socket to _active_sock while the loop runs (so the
+// destructor can wake it) and unpublish on any exit, all under the mutex.
+namespace {
+	struct ActiveSockGuard {
+		std::mutex &mtx;
+		LocalSocket *&slot;
+		ActiveSockGuard(std::mutex &m, LocalSocket *&s, LocalSocket *v) : mtx(m), slot(s)
+		{
+			std::lock_guard<std::mutex> lock(mtx);
+			slot = v;
+		}
+		~ActiveSockGuard()
+		{
+			std::lock_guard<std::mutex> lock(mtx);
+			slot = nullptr;
+		}
+	};
 }
 
 void *TestController::ThreadProc()
@@ -48,8 +77,12 @@ void TestController::ClientLoop(const std::string &ipc_client)
 {
 	LocalSocketClient sock(LocalSocket::DATAGRAM, _ipc_server, ipc_client);
 	sock.SetBufferSize(1024 * 1024);
+	ActiveSockGuard sock_guard(_sock_mtx, _active_sock, &sock);
 	sock.Send(&_buf, ClientDispatchStatus());
 	for (;;) {
+		if (_stop) {
+			return; // asked to stop between commands
+		}
 		size_t len = sock.Recv(&_buf, sizeof(_buf));
 		if (len < sizeof(_buf.cmd)) {
 			throw std::runtime_error(StrPrintf("too small len %lu", (unsigned long)len));
@@ -235,6 +268,11 @@ size_t TestController::ClientDispatchSendKey(size_t len)
 {
 	if (len < sizeof(TestRequestSendKey)) {
 		throw std::runtime_error(StrPrintf("len=%lu < sizeof(TestRequestSendKey)", (unsigned long)len));
+	}
+	// Defensive: the ordered shutdown (stop+join before nulling the console) should
+	// make this unreachable, but never dereference a torn-down input queue.
+	if (!g_winport_con_in) {
+		return 0;
 	}
 	INPUT_RECORD ir{};
 	ir.EventType = KEY_EVENT;

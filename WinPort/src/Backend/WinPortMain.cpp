@@ -585,6 +585,14 @@ extern "C" int WinPortMain(const char *full_exe_path, int argc, char **argv, int
 		}
 	}
 
+#ifdef TESTING
+	// Stop the test controller (joins its worker thread) before dropping the console
+	// objects it reads/writes below - otherwise, in the --mortal path that runs this
+	// teardown (the immortal path _exit()s and skips it), its loop can dereference a
+	// null g_winport_con_in mid-shutdown and crash (D014).
+	test_ctl.reset();
+#endif
+
 	g_winport_con_out = nullptr;
 	g_winport_con_in = nullptr;
 
