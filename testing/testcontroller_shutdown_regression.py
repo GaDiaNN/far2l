@@ -37,18 +37,14 @@ Usage:
 Exit code 0 if every iteration exited cleanly; 1 if any iteration hung or
 crashed (prints a per-iteration breakdown either way).
 
-Known platform gap (unrelated to the fix under test, not root-caused yet):
-on macOS, the wait-for-dialog request reaches far2l fine (visible in its own
-log as "got command 3") but no reply arrives before the timeout, so every
-iteration reports 'setup_failed' instead of a meaningful HUNG/ok/CRASH
-outcome. This isn't a unix-datagram size limit - raising SO_SNDBUF/SO_RCVBUF
-on both ends (this script does so unconditionally, harmless on Linux) lets
-datagrams well past 2KB through fine, and the relevant sockets on both the
-harness and far2l's own ClientLoop already do that upstream. It looks more
-like one of the several other macOS-specific test-timing quirks this project
-has run into before, not diagnosed further here since it doesn't affect the
-fix's own correctness. This script is fully verified on Linux (150/150 HUNG
-pre-fix, 0/150 post-fix, no timing tricks).
+Fully verified on Linux (150/150 HUNG pre-fix, 0/150 post-fix, no timing
+tricks). On macOS this script's own minimal, non-draining pty handling runs
+into another instance of D009 (far2l blocks on a TTY-restore write/tcdrain
+during shutdown once its output isn't being actively read) - both builds
+report HUNG there, which is a limitation of this diagnostic script rather
+than of the fix. See testing/src/shutdown-race-check for a version that
+avoids this by reusing the same termtest-based pty handling as the main
+harness (which drains continuously by design).
 """
 import fcntl
 import os
@@ -96,9 +92,16 @@ def start_far2l(far2l_bin, profile, left, right, sock_path):
 		fcntl.ioctl(0, termios.TIOCSCTTY, 0)
 		if slave_fd > 2:
 			os.close(slave_fd)
+		# D009: far2l is a terminal application - it blocks in tcsetattr(TCSADRAIN)/
+		# tcdrain/write until its terminal output has been consumed by the pty's
+		# master side. Nothing here reads that side, so route stdout/stderr to
+		# /dev/null at the shell level (FAR2L_STD alone is not enough - it only
+		# covers far2l's own buffered stdio writes, not the raw TTY-rendering
+		# writes) and keep the pty as stdin only, for window-size/raw-mode ioctls.
+		shcmd = ('exec ' + far2l_bin + ' --tty --nodetect --mortal -u ' + profile
+		         + ' -cd ' + left + ' -cd ' + right + ' >/dev/null 2>&1')
 		try:
-			os.execve(far2l_bin, [far2l_bin, '--tty', '--nodetect', '--mortal',
-			                       '-u', profile, '-cd', left, '-cd', right], env)
+			os.execve('/bin/sh', ['/bin/sh', '-c', shcmd], env)
 		except OSError:
 			pass
 		os._exit(127)
