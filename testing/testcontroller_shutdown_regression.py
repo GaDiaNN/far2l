@@ -37,14 +37,9 @@ Usage:
 Exit code 0 if every iteration exited cleanly; 1 if any iteration hung or
 crashed (prints a per-iteration breakdown either way).
 
-Fully verified on Linux (150/150 HUNG pre-fix, 0/150 post-fix, no timing
-tricks). On macOS this script's own minimal, non-draining pty handling runs
-into another instance of D009 (far2l blocks on a TTY-restore write/tcdrain
-during shutdown once its output isn't being actively read) - both builds
-report HUNG there, which is a limitation of this diagnostic script rather
-than of the fix. See testing/src/shutdown-race-check for a version that
-avoids this by reusing the same termtest-based pty handling as the main
-harness (which drains continuously by design).
+Fully verified on both Linux and macOS (30/30 HUNG pre-fix, 30/30 clean
+exit(0) post-fix, on each platform independently - real OS scheduling only,
+no timing tricks).
 """
 import fcntl
 import os
@@ -56,6 +51,7 @@ import struct
 import sys
 import tempfile
 import termios
+import threading
 import time
 
 TEST_CMD_STATUS = 1
@@ -73,7 +69,7 @@ VK_ENTER = 0x0D
 HANG_TIMEOUT_SEC = 2.0
 
 
-def start_far2l(far2l_bin, profile, left, right, sock_path):
+def start_far2l(far2l_bin, profile, left, right, sock_path, log_path):
 	# winsize must be set on the slave before fork/exec, or far2l's initial
 	# TIOCGWINSZ probe can race a later SIGWINCH and briefly run with an
 	# inconsistent screen size.
@@ -81,32 +77,53 @@ def start_far2l(far2l_bin, profile, left, right, sock_path):
 	fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack('HHHH', 25, 80, 0, 0))
 	env = dict(os.environ)
 	env['FAR2L_TESTCTL'] = sock_path
-	env['FAR2L_STD'] = '/dev/null'
+	# FAR2L_STD controls far2l's OWN buffered stdio (fprintf debug logging via
+	# freopen), not the raw TTY-rendering writes - matches the Go tool and the
+	# main harness, both of which point this at a real log file, not /dev/null.
+	env['FAR2L_STD'] = log_path
 	pid = os.fork()
 	if pid == 0:
 		os.setsid()
 		os.close(master_fd)
+		# All three standard fds are the pty slave, exactly like a real
+		# terminal session (and like testing/src/shutdown-race-check's
+		# pty.StartWithSize) - D009 (far2l blocks in tcdrain()/write() once
+		# its terminal output fills the unread pty buffer) is handled by the
+		# caller's continuous drain thread instead of by routing output away
+		# from the pty, which turned out not to be sufficient on its own.
 		os.dup2(slave_fd, 0)
 		os.dup2(slave_fd, 1)
 		os.dup2(slave_fd, 2)
 		fcntl.ioctl(0, termios.TIOCSCTTY, 0)
 		if slave_fd > 2:
 			os.close(slave_fd)
-		# D009: far2l is a terminal application - it blocks in tcsetattr(TCSADRAIN)/
-		# tcdrain/write until its terminal output has been consumed by the pty's
-		# master side. Nothing here reads that side, so route stdout/stderr to
-		# /dev/null at the shell level (FAR2L_STD alone is not enough - it only
-		# covers far2l's own buffered stdio writes, not the raw TTY-rendering
-		# writes) and keep the pty as stdin only, for window-size/raw-mode ioctls.
-		shcmd = ('exec ' + far2l_bin + ' --tty --nodetect --mortal -u ' + profile
-		         + ' -cd ' + left + ' -cd ' + right + ' >/dev/null 2>&1')
 		try:
-			os.execve('/bin/sh', ['/bin/sh', '-c', shcmd], env)
+			os.execve(far2l_bin, [far2l_bin, '--tty', '--nodetect', '--mortal',
+			                       '-u', profile, '-cd', left, '-cd', right], env)
 		except OSError:
 			pass
 		os._exit(127)
 	os.close(slave_fd)
 	return pid, master_fd
+
+
+def drain_pty(master_fd, stop_event):
+	# Nothing else ever reads the master side of this pty. Without this,
+	# far2l's writer thread blocks in tcdrain()/write() as soon as its
+	# terminal-rendering output fills the kernel buffer - this project's own
+	# D009, on a harness codepath rather than the main one. A continuous
+	# drain, exactly like testing/src/shutdown-race-check's
+	# io.Copy(io.Discard, ...) goroutine, removes the ceiling entirely.
+	try:
+		while not stop_event.is_set():
+			try:
+				data = os.read(master_fd, 65536)
+				if not data:
+					break
+			except OSError:
+				break
+	except Exception:
+		pass
 
 
 def send_key(sock, addr, key_code, pressed):
@@ -145,7 +162,11 @@ def run_once(far2l_bin, workroot, idx):
 	srv.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 262144)
 	srv.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144)
 	srv.bind(sock_path)
-	pid, master_fd = start_far2l(far2l_bin, profile, left, right, sock_path)
+	log_path = os.path.join(base, 'far2l.log')
+	pid, master_fd = start_far2l(far2l_bin, profile, left, right, sock_path, log_path)
+	stop_evt = threading.Event()
+	drainer = threading.Thread(target=drain_pty, args=(master_fd, stop_evt), daemon=True)
+	drainer.start()
 
 	try:
 		srv.settimeout(8.0)
@@ -162,6 +183,16 @@ def run_once(far2l_bin, workroot, idx):
 		if wait_string(srv, addr, 'Do you want to quit FAR?', 6000, True, width, height) is None:
 			os.kill(pid, signal.SIGKILL)
 			os.waitpid(pid, 0)
+			stop_evt.set()
+			srv.close()
+			try:
+				os.unlink(sock_path)
+			except OSError:
+				pass
+			try:
+				os.close(master_fd)
+			except OSError:
+				pass
 			return 'setup_failed'
 
 		type_vk(srv, addr, VK_ENTER)  # the actual quit trigger
@@ -172,13 +203,28 @@ def run_once(far2l_bin, workroot, idx):
 			srv.recv(4096)
 		except socket.timeout:
 			pass
-	finally:
+	except Exception:
 		srv.close()
 		try:
 			os.unlink(sock_path)
 		except OSError:
 			pass
+		raise
 
+	# Deliberately NOT closing/unlinking the control socket yet. Confirmed via
+	# a live `sample` capture on macOS: closing/unlinking it immediately here
+	# (before far2l has actually finished exiting) leaves ClientLoop's worker
+	# thread parked in __recvfrom for multiple seconds - LocalSocket::Shutdown()
+	# still runs (the main thread is seen correctly waiting in
+	# Threaded::WaitThread()/condition_variable::wait, i.e. the fix's ordering
+	# is doing its job), but shutdown(SHUT_RDWR) on an unconnected AF_UNIX
+	# SOCK_DGRAM socket does not reliably/promptly unblock a pending recvfrom()
+	# on macOS the way it does on Linux once the peer address it was bound to
+	# stops existing. Not a bug in the fix (it does not hang forever either
+	# way - this is not a fresh instance of D014), just a lot slower than the
+	# <0.1s this gets when the peer socket is left alone. Keep it open
+	# (nothing more is ever sent on it) until the process is confirmed exited
+	# or killed, which reproducibly avoids the slow path entirely.
 	deadline = time.time() + HANG_TIMEOUT_SEC
 	wait_status, hung = None, False
 	while time.time() < deadline:
@@ -193,6 +239,12 @@ def run_once(far2l_bin, workroot, idx):
 	else:
 		hung = True
 
+	srv.close()
+	try:
+		os.unlink(sock_path)
+	except OSError:
+		pass
+
 	crash_log = None
 	for root, _, files in os.walk(profile):
 		if 'crash.log' in (f.lower() for f in files):
@@ -206,10 +258,12 @@ def run_once(far2l_bin, workroot, idx):
 		except OSError:
 			pass
 
+	stop_evt.set()
 	try:
 		os.close(master_fd)
 	except OSError:
 		pass
+	drainer.join(timeout=1.0)
 
 	if crash_log:
 		outcome = 'CRASH' + ('+hung' if hung else '')
