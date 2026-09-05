@@ -36,6 +36,21 @@ Usage:
 
 Exit code 0 if every iteration exited cleanly; 1 if any iteration hung or
 crashed (prints a per-iteration breakdown either way).
+
+Known platform limitation (unrelated to the fix under test): the wait-for-
+text request below (TestRequestWaitString) carries a fixed 2048-byte string
+field, several dozen bytes past macOS/BSD's default unix-datagram ceiling
+(net.local.dgram.maxdgram, default 2048 - confirmed 2048 on the machine this
+was tested on). This script raises its own SO_SNDBUF/SO_RCVBUF unconditionally
+(harmless on Linux, necessary on macOS) so its own send of that request does
+not fail outright, but on a far2l binary built WITHOUT the separate,
+already-tracked fix for that same class of macOS datagram-size limit (raising
+the equivalent buffers on far2l's own listening socket - out of scope for
+this PR), far2l's receiving socket can still silently drop the incoming
+request, and every iteration will report 'setup_failed' rather than a
+meaningful HUNG/ok/CRASH outcome. This script is fully verified on Linux
+(150/150 HUNG pre-fix, 0/150 post-fix, no timing tricks); on macOS it needs
+that separate datagram-size fix present in the binary under test first.
 """
 import fcntl
 import os
@@ -120,6 +135,14 @@ def run_once(far2l_bin, workroot, idx):
 	sock_path = tempfile.mktemp(prefix='tc_shutdown_', suffix='.sock')
 
 	srv = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+	# TestRequestWaitString's wire struct carries a fixed 2048-byte string
+	# field (TestProtocol.h), so a WAIT_STRING datagram always runs a couple
+	# hundred bytes past 2KB. That is under Linux's default unix-dgram limit
+	# but over macOS/BSD's (net.local.dgram.maxdgram, default 2048) - raise
+	# both buffers unconditionally so the same script works on every
+	# platform instead of branching on `sys.platform`.
+	srv.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 262144)
+	srv.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144)
 	srv.bind(sock_path)
 	pid, master_fd = start_far2l(far2l_bin, profile, left, right, sock_path)
 
@@ -217,7 +240,7 @@ def main():
 		outcome = run_once(far2l_bin, workroot, i)
 		counts[outcome] = counts.get(outcome, 0) + 1
 		if outcome != 'ok':
-			print('[%03d] %s' % (i, outcome))
+			print('[%03d] %s' % (i, outcome), flush=True)
 
 	elapsed = time.time() - t0
 	print('==== %d iterations in %.1fs (%.2fs/iter) ====' % (iterations, elapsed, elapsed / iterations))
