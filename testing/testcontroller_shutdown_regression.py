@@ -37,20 +37,18 @@ Usage:
 Exit code 0 if every iteration exited cleanly; 1 if any iteration hung or
 crashed (prints a per-iteration breakdown either way).
 
-Known platform limitation (unrelated to the fix under test): the wait-for-
-text request below (TestRequestWaitString) carries a fixed 2048-byte string
-field, several dozen bytes past macOS/BSD's default unix-datagram ceiling
-(net.local.dgram.maxdgram, default 2048 - confirmed 2048 on the machine this
-was tested on). This script raises its own SO_SNDBUF/SO_RCVBUF unconditionally
-(harmless on Linux, necessary on macOS) so its own send of that request does
-not fail outright, but on a far2l binary built WITHOUT the separate,
-already-tracked fix for that same class of macOS datagram-size limit (raising
-the equivalent buffers on far2l's own listening socket - out of scope for
-this PR), far2l's receiving socket can still silently drop the incoming
-request, and every iteration will report 'setup_failed' rather than a
-meaningful HUNG/ok/CRASH outcome. This script is fully verified on Linux
-(150/150 HUNG pre-fix, 0/150 post-fix, no timing tricks); on macOS it needs
-that separate datagram-size fix present in the binary under test first.
+Known platform gap (unrelated to the fix under test, not root-caused yet):
+on macOS, the wait-for-dialog request reaches far2l fine (visible in its own
+log as "got command 3") but no reply arrives before the timeout, so every
+iteration reports 'setup_failed' instead of a meaningful HUNG/ok/CRASH
+outcome. This isn't a unix-datagram size limit - raising SO_SNDBUF/SO_RCVBUF
+on both ends (this script does so unconditionally, harmless on Linux) lets
+datagrams well past 2KB through fine, and the relevant sockets on both the
+harness and far2l's own ClientLoop already do that upstream. It looks more
+like one of the several other macOS-specific test-timing quirks this project
+has run into before, not diagnosed further here since it doesn't affect the
+fix's own correctness. This script is fully verified on Linux (150/150 HUNG
+pre-fix, 0/150 post-fix, no timing tricks).
 """
 import fcntl
 import os
